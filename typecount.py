@@ -1,99 +1,77 @@
-import subprocess
-import sys
-import time
-from collections import defaultdict
+#!/usr/bin/env python3
 
-def write_type_plain(count):
-    with open('Test.java', 'w') as f:
-        f.write("public class Test {\n");
-        f.write("public <")
-        for i in range(count):
-            if i > 0:
-                f.write(", ")
-            f.write("A" + str(i + 1))
-        f.write("> void testMethod() {}")
-        f.write("}")
-        
-def write_type_compact(count):
-    with open('Test.java', 'w') as f:
-        f.write("public class Test {\n")
-        f.write("public <")
-        for i in range(count):
-            if (i > 0):
-                f.write(", ")
-            f.write(type_var(i))
-        f.write("> void testMethod() {}")
-        f.write("}")
+from string import ascii_lowercase, ascii_uppercase
+from itertools import chain, product, count, tee, islice, repeat
+from subprocess import check_call, CalledProcessError
+from tempfile import mkdtemp
+from pathlib import Path
+from argparse import ArgumentParser
+from logging import getLogger, DEBUG, basicConfig
 
-def write_type_compact_extends(count):
-    with open('Test.java', 'w') as f:
-        f.write("public class Test {\n")
-        f.write("public <")
-        for i in range(count):
-            if (i > 0):
-                f.write(", ")
-            s = type_var(i)
-            f.write(s)
-            if (s != 'A'):
-                f.write(" extends A")
-        f.write("> void testMethod() {}")
-        f.write("}")
-        
-substitutes = {
-    'if': 'À',
-    'do': 'Á'
+logger = getLogger(__name__)
+basicConfig(level=DEBUG)
+
+nwise = lambda g, n=2: zip(*(islice(g, i, None) for i, g in enumerate(tee(g, n))))
+first = lambda g, n=1: zip(chain(repeat(True, n), repeat(False)), g)
+
+KEYWORDS = {
+    'abstract', 'assert'      , 'boolean' , 'break'     ,
+    'byte'    , 'case'        , 'catch'   , 'char'      ,
+    'class'   , 'const'       , 'continue', 'default'   ,
+    'do'      , 'double'      , 'else'    , 'enum'      ,
+    'extends' , 'final'       , 'finally' , 'float'     ,
+    'for'     , 'goto'        , 'if'      , 'implements',
+    'import'  , 'instanceof'  , 'int'     , 'interface' ,
+    'long'    , 'native'      , 'new'     , 'package'   ,
+    'private' , 'protected'   , 'public'  , 'return'    ,
+    'short'   , 'static'      , 'strictfp', 'super'     ,
+    'switch'  , 'synchronized', 'this'    , 'throw'     ,
+    'throws'  , 'transient'   , 'try'     , 'void'      ,
+    'volatile', 'while'       , 'true'    , 'false'     ,
+    'null'    ,
 }
-        
-def type_var(i):
-    type_var_chars = [to_id_letter(i % 53)]
-    remainder = i // 53
-    while (remainder > 0):
-        type_var_chars.append(to_id_char(remainder % 64))
-        remainder = remainder // 64
-    type_var = ''.join(type_var_chars)
-    if type_var in substitutes:
-        return substitutes[type_var]
-    return type_var
-        
-def to_id_letter(i):
-    if i < 26:
-        return chr(65 + i)
-    elif i < 52:
-        return chr(97 + i - 26)
-    else:
-        return "$"
+names = lambda src: (''.join(x) for x in chain.from_iterable(product(src, repeat=n) for n in count(1)))
+valid_names = lambda src: (n for n in names(src) if n not in KEYWORDS)
 
-def to_id_char(i):
-    if i < 52:
-        return to_id_letter(i)
-    elif i < 62:
-        return str(i - 52)
-    elif i == 63:
-        return "_"
-    else:
-        return "$"
+java_code = lambda params: '''
+public class Test {{
+    public <{params}> void testMethod() {{}}
+}}
+'''.format(params=', '.join(params))
 
-def find_max(f):
-    failed = False
-    largest_success = 8
-    target = 8
-    smallest_failure = sys.maxsize
-    
-    while largest_success + 1 < smallest_failure:
-        if not failed:
-            target = largest_success * 2
-        else:
-            target = (largest_success + smallest_failure) // 2
-        f(target)
-        status = subprocess.call(["javac", "/home/justin/code/typecount/Test.java"])
-        if status is not 0:
-            failed = True
-            smallest_failure = target
-        else:
-            largest_success = target
-    return largest_success
+def java_code_extends(params):
+    params = (y if is_first else f'{y} extends {x}' for is_first, (x, y) in first(nwise(params)))
+    return java_code(params)
+
+def search(path, code_func, names, bounds):
+    logger.debug('Searching @ %r', bounds)
+    if bounds.stop - bounds.start <= 1:
+        return bounds.start
+    filename = path / 'Test.java'
+    idx = (bounds.stop + bounds.start) // 2
+    with open(filename, 'w') as f:
+        f.write(code_func(names[:idx]))
+    try:
+        rv = check_call(['javac', filename])
+        return search(path, code_func, names, range(idx, bounds.stop))
+    except CalledProcessError:
+        return search(path, code_func, names, range(bounds.start, idx))
+
+parser = ArgumentParser()
+parser.add_argument('-p', '--path', type=Path)
+parser.add_argument('-m', '--max', type=int, default=10_000)
+parser.add_argument('-s', '--src', type=str)
 
 if __name__ == "__main__":
-    print("largest type: ", find_max(write_type_plain))
-    print("compact identifiers: ", find_max(write_type_compact))
-    print("with extends:", find_max(write_type_compact_extends))
+    args = parser.parse_args()
+    path = Path(mkdtemp()) if args.path is None else args.path
+    bounds = range(0, args.max)
+    src = ascii_uppercase + ascii_lowercase if args.src is None else args.src
+
+    logger.debug('Path = %r', path)
+    rv = search(path, java_code_extends, list(islice(valid_names(src), bounds.stop)), bounds)
+    logger.info('Found maximum number of arguments %s', rv)
+    logger.info('File at <%s>', path)
+    with open(path / 'Test.java') as f:
+        for line in f:
+            logger.info('> %s', line.rstrip('\n'))
